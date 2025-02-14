@@ -1,18 +1,7 @@
-import { AddressString, Chain } from ':core/type';
+import { RequestArguments } from ':core/provider/interface.js';
 
-type UpdateSource = 'wallet' | 'storage';
-
-export interface AccountsUpdate {
-  accounts: AddressString[];
-  source: UpdateSource;
-}
-
-export interface ChainUpdate {
-  chain: Chain;
-  source: UpdateSource;
-}
-
-export interface StateUpdateListener {
-  onAccountsUpdate: (_: AccountsUpdate) => void;
-  onChainUpdate: (_: ChainUpdate) => void;
+export interface Signer {
+  handshake(_: RequestArguments): Promise<void>;
+  request<T>(_: RequestArguments): Promise<T>;
+  cleanup: () => Promise<void>;
 }

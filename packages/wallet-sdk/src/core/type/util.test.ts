@@ -1,6 +1,7 @@
-import { HexString, IntNumber } from '.';
+import { HexString } from './index.js';
 import {
   bigIntStringFromBigInt,
+  encodeToHexString,
   ensureAddressString,
   ensureBigInt,
   ensureBuffer,
@@ -12,7 +13,7 @@ import {
   getFavicon,
   has0xPrefix,
   hexStringFromBuffer,
-  hexStringFromIntNumber,
+  hexStringFromNumber,
   hexStringToUint8Array,
   intNumberFromHexString,
   isHexString,
@@ -21,7 +22,7 @@ import {
   range,
   strip0x,
   uint8ArrayToHex,
-} from './util';
+} from './util.js';
 
 const uint8ArrVal = new Uint8Array(6);
 const hexString = 'E556B9bfEFDd5B190c67b521ED0A7d19Ab89a311';
@@ -48,6 +49,14 @@ describe('util', () => {
     expect(hexStringFromBuffer(Buffer.alloc(3), true)).toEqual('0x000000');
   });
 
+  test('endcodeToHexString', () => {
+    expect(encodeToHexString('')).toEqual('0x');
+    expect(encodeToHexString('713')).toEqual('0x0713');
+    expect(
+      encodeToHexString('My name is Giovanni Giorgio, but everybody calls me... Jungho')
+    ).toEqual(expect.stringContaining('0x4d79206e'));
+  });
+
   test('bigIntStringFromBigInt', () => {
     expect(
       bigIntStringFromBigInt(BigInt(0b11111111111111111111111111111111111111111111111111111))
@@ -58,9 +67,9 @@ describe('util', () => {
     expect(intNumberFromHexString(HexString('0x1fffffffffffff'))).toEqual(9007199254740991);
   });
 
-  test('hexStringFromIntNumber', () => {
-    expect(hexStringFromIntNumber(IntNumber(1234))).toEqual('0x4d2');
-    expect(hexStringFromIntNumber(IntNumber(112341234234))).toEqual('0x1a280f323a');
+  test('hexStringFromNumber', () => {
+    expect(hexStringFromNumber(1234)).toEqual('0x4d2');
+    expect(hexStringFromNumber(112341234234)).toEqual('0x1a280f323a');
   });
 
   test('has0xPrefix', () => {
@@ -190,7 +199,7 @@ describe('util', () => {
       document.head.innerHTML = `
       <link rel="shortcut icon" sizes="16x16 24x24" href="/favicon.ico">
     `;
-      expect(getFavicon()).toEqual('http://localhost/favicon.ico');
+      expect(getFavicon()).toEqual('http://localhost:3000/favicon.ico');
     });
   });
 });
