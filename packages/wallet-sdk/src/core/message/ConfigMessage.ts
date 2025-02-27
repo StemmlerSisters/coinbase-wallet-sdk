@@ -1,4 +1,4 @@
-import { Message } from './Message';
+import { Message } from './Message.js';
 
 export interface ConfigMessage extends Message {
   event: ConfigEvent;
@@ -11,4 +11,4 @@ export type ConfigEvent =
   | 'WalletLinkSessionRequest'
   | 'WalletLinkUpdate';
 
-export type SignerType = 'scw' | 'walletlink' | 'extension';
+export type SignerType = 'scw' | 'walletlink';

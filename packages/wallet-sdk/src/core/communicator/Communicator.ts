@@ -1,8 +1,16 @@
-import { LIB_VERSION } from '../../version';
-import { ConfigMessage, Message, MessageID } from '../message';
-import { closePopup, openPopup } from './util';
-import { CB_KEYS_URL } from ':core/constants';
-import { standardErrors } from ':core/error';
+import { VERSION } from '../../sdk-info.js';
+import { ConfigMessage } from '../message/ConfigMessage.js';
+import { Message, MessageID } from '../message/Message.js';
+import { CB_KEYS_URL } from ':core/constants.js';
+import { standardErrors } from ':core/error/errors.js';
+import { AppMetadata, Preference } from ':core/provider/interface.js';
+import { closePopup, openPopup } from ':util/web.js';
+
+export type CommunicatorOptions = {
+  url?: string;
+  metadata: AppMetadata;
+  preference: Preference;
+};
 
 /**
  * Communicates with a popup window for Coinbase keys.coinbase.com (or another url)
@@ -14,12 +22,16 @@ import { standardErrors } from ':core/error';
  * It also handles cleanup of event listeners and the popup window itself when necessary.
  */
 export class Communicator {
+  private readonly metadata: AppMetadata;
+  private readonly preference: Preference;
   private readonly url: URL;
   private popup: Window | null = null;
   private listeners = new Map<(_: MessageEvent) => void, { reject: (_: Error) => void }>();
 
-  constructor(url: string = CB_KEYS_URL) {
+  constructor({ url = CB_KEYS_URL, metadata, preference }: CommunicatorOptions) {
     this.url = new URL(url);
+    this.metadata = metadata;
+    this.preference = preference;
   }
 
   /**
@@ -66,6 +78,7 @@ export class Communicator {
    * Closes the popup, rejects all requests and clears the listeners
    */
   private disconnect = () => {
+    // Note: keys popup handles closing itself. this is a fallback.
     closePopup(this.popup);
     this.popup = null;
 
@@ -80,9 +93,13 @@ export class Communicator {
    * Waits for the popup window to fully load and then sends a version message.
    */
   waitForPopupLoaded = async (): Promise<Window> => {
-    if (this.popup && !this.popup.closed) return this.popup;
+    if (this.popup && !this.popup.closed) {
+      // In case the user un-focused the popup between requests, focus it again
+      this.popup.focus();
+      return this.popup;
+    }
 
-    this.popup = openPopup(this.url);
+    this.popup = await openPopup(this.url);
 
     this.onMessage<ConfigMessage>(({ event }) => event === 'PopupUnload')
       .then(this.disconnect)
@@ -92,7 +109,12 @@ export class Communicator {
       .then((message) => {
         this.postMessage({
           requestId: message.id,
-          data: { version: LIB_VERSION },
+          data: {
+            version: VERSION,
+            metadata: this.metadata,
+            preference: this.preference,
+            location: window.location.toString(),
+          },
         });
       })
       .then(() => {

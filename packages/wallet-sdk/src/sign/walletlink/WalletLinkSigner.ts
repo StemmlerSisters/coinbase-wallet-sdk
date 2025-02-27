@@ -1,103 +1,53 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-
 // Copyright (c) 2018-2024 Coinbase, Inc. <https://www.coinbase.com/>
 
-import eip712 from '../../vendor-js/eth-eip712-util';
-import { StateUpdateListener } from '../interface';
-import { LOCAL_STORAGE_ADDRESSES_KEY } from './relay/constants';
-import { RelayEventManager } from './relay/RelayEventManager';
-import { EthereumTransactionParams } from './relay/type/EthereumTransactionParams';
-import { JSONRPCRequest, JSONRPCResponse } from './relay/type/JSONRPC';
-import { isErrorResponse, Web3Response } from './relay/type/Web3Response';
-import { WalletLinkRelay } from './relay/WalletLinkRelay';
-import { WALLETLINK_URL } from ':core/constants';
-import { standardErrorCodes, standardErrors } from ':core/error';
-import { AppMetadata, RequestArguments, Signer } from ':core/provider/interface';
-import { AddressString, IntNumber } from ':core/type';
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-nocheck
+import eip712 from '../../vendor-js/eth-eip712-util/index.cjs';
+import { Signer } from '../interface.js';
+import { LOCAL_STORAGE_ADDRESSES_KEY } from './relay/constants.js';
+import { EthereumTransactionParams } from './relay/type/EthereumTransactionParams.js';
+import { isErrorResponse } from './relay/type/Web3Response.js';
+import { WalletLinkRelay } from './relay/WalletLinkRelay.js';
+import { WALLETLINK_URL } from ':core/constants.js';
+import { standardErrors } from ':core/error/errors.js';
+import { AppMetadata, ProviderEventCallback, RequestArguments } from ':core/provider/interface.js';
+import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage.js';
+import { Address } from ':core/type/index.js';
 import {
+  encodeToHexString,
   ensureAddressString,
   ensureBigInt,
   ensureBuffer,
   ensureIntNumber,
   ensureParsedJSONObject,
-  hexStringFromIntNumber,
-} from ':core/type/util';
-import { ScopedLocalStorage } from ':util/ScopedLocalStorage';
-
+  hexStringFromBuffer,
+  hexStringFromNumber,
+} from ':core/type/util.js';
+import { fetchRPCRequest } from ':util/provider.js';
 const DEFAULT_CHAIN_ID_KEY = 'DefaultChainId';
 const DEFAULT_JSON_RPC_URL = 'DefaultJsonRpcUrl';
 
-interface AddEthereumChainParams {
-  chainId: string;
-  blockExplorerUrls?: string[];
-  chainName?: string;
-  iconUrls?: string[];
-  rpcUrls?: string[];
-  nativeCurrency?: {
-    name: string;
-    symbol: string;
-    decimals: number;
-  };
-}
-
-interface SwitchEthereumChainParams {
-  chainId: string;
-}
-
-interface WatchAssetParams {
-  type: string;
-  options: {
-    address: string;
-    symbol?: string;
-    decimals?: number;
-    image?: string;
-  };
-}
+type RequestParam = unknown[];
 
 // original source: https://github.com/coinbase/coinbase-wallet-sdk/blob/v3.7.1/packages/wallet-sdk/src/provider/CoinbaseWalletProvider.ts
 export class WalletLinkSigner implements Signer {
-  private _appName: string;
-  private _appLogoUrl: string | null;
+  private metadata: AppMetadata;
   private _relay: WalletLinkRelay | null = null;
   private readonly _storage: ScopedLocalStorage;
-  private readonly _relayEventManager: RelayEventManager;
-  private _jsonRpcUrlFromOpts: string;
-  private _addresses: AddressString[] = [];
-  private hasMadeFirstChainChangedEmission = false;
-  private updateListener?: StateUpdateListener;
+  private _addresses: Address[] = [];
+  private callback: ProviderEventCallback | null;
 
-  constructor(options: { metadata: AppMetadata; updateListener?: StateUpdateListener }) {
-    const { appName, appLogoUrl } = options.metadata;
-    this._appName = appName;
-    this._appLogoUrl = appLogoUrl;
+  constructor(options: { metadata: AppMetadata; callback?: ProviderEventCallback }) {
+    this.metadata = options.metadata;
     this._storage = new ScopedLocalStorage('walletlink', WALLETLINK_URL);
-    this.updateListener = options.updateListener;
-
-    this._relayEventManager = new RelayEventManager();
-    this._jsonRpcUrlFromOpts = '';
+    this.callback = options.callback || null;
 
     const cachedAddresses = this._storage.getItem(LOCAL_STORAGE_ADDRESSES_KEY);
     if (cachedAddresses) {
-      const addresses = cachedAddresses.split(' ') as AddressString[];
+      const addresses = cachedAddresses.split(' ') as Address[];
       if (addresses[0] !== '') {
         this._addresses = addresses.map((address) => ensureAddressString(address));
-        this.updateListener?.onAccountsUpdate({
-          accounts: this._addresses,
-          source: 'storage',
-        });
       }
-    }
-
-    const cachedChainId = this._storage.getItem(DEFAULT_CHAIN_ID_KEY);
-    if (cachedChainId) {
-      this.updateListener?.onChainUpdate({
-        chain: {
-          id: this.getChainId(),
-          rpcUrl: this.jsonRpcUrl,
-        },
-        source: 'storage',
-      });
-      this.hasMadeFirstChainChangedEmission = true;
     }
 
     this.initializeRelay();
@@ -109,17 +59,16 @@ export class WalletLinkSigner implements Signer {
     return { id, secret };
   }
 
-  async handshake(): Promise<AddressString[]> {
-    const ethAddresses = await this.request<AddressString[]>({ method: 'eth_requestAccounts' });
-    return ethAddresses;
+  async handshake() {
+    await this._eth_requestAccounts();
   }
 
-  get selectedAddress(): AddressString | undefined {
+  private get selectedAddress(): Address | undefined {
     return this._addresses[0] || undefined;
   }
 
-  private get jsonRpcUrl(): string {
-    return this._storage.getItem(DEFAULT_JSON_RPC_URL) ?? this._jsonRpcUrlFromOpts;
+  private get jsonRpcUrl(): string | undefined {
+    return this._storage.getItem(DEFAULT_JSON_RPC_URL) ?? undefined;
   }
 
   private set jsonRpcUrl(value: string) {
@@ -133,26 +82,43 @@ export class WalletLinkSigner implements Signer {
     const originalChainId = this.getChainId();
     this._storage.setItem(DEFAULT_CHAIN_ID_KEY, chainId.toString(10));
     const chainChanged = ensureIntNumber(chainId) !== originalChainId;
-    if (chainChanged || !this.hasMadeFirstChainChangedEmission) {
-      this.updateListener?.onChainUpdate({
-        chain: { id: chainId, rpcUrl: jsonRpcUrl },
-        source: 'wallet',
-      });
-      this.hasMadeFirstChainChangedEmission = true;
+    if (chainChanged) {
+      this.callback?.('chainChanged', hexStringFromNumber(chainId));
     }
   }
 
-  private async watchAsset(
-    type: string,
-    address: string,
-    symbol?: string,
-    decimals?: number,
-    image?: string,
-    chainId?: number
-  ): Promise<boolean> {
+  private async watchAsset(params: RequestParam) {
+    const request = (Array.isArray(params) ? params[0] : params) as {
+      type: string;
+      options: {
+        address: string;
+        symbol?: string;
+        decimals?: number;
+        image?: string;
+      };
+    };
+    if (!request.type) {
+      throw standardErrors.rpc.invalidParams('Type is required');
+    }
+
+    if (request?.type !== 'ERC20') {
+      throw standardErrors.rpc.invalidParams(`Asset of type '${request.type}' is not supported`);
+    }
+
+    if (!request?.options) {
+      throw standardErrors.rpc.invalidParams('Options are required');
+    }
+
+    if (!request?.options.address) {
+      throw standardErrors.rpc.invalidParams('Address is required');
+    }
+
+    const chainId = this.getChainId();
+    const { address, symbol, image, decimals } = request.options;
+
     const relay = this.initializeRelay();
     const result = await relay.watchAsset(
-      type,
+      request.type,
       address,
       symbol,
       decimals,
@@ -165,30 +131,50 @@ export class WalletLinkSigner implements Signer {
     return !!result.result;
   }
 
-  private async addEthereumChain(
-    chainId: number,
-    rpcUrls: string[],
-    blockExplorerUrls: string[],
-    chainName: string,
-    iconUrls: string[],
-    nativeCurrency: {
-      name: string;
-      symbol: string;
-      decimals: number;
+  private async addEthereumChain(params: RequestParam) {
+    const request = params[0] as {
+      chainId: string;
+      blockExplorerUrls?: string[];
+      chainName?: string;
+      iconUrls?: string[];
+      rpcUrls?: string[];
+      nativeCurrency?: {
+        name: string;
+        symbol: string;
+        decimals: number;
+      };
+    };
+
+    if (request.rpcUrls?.length === 0) {
+      throw standardErrors.rpc.invalidParams('please pass in at least 1 rpcUrl');
     }
-  ): Promise<boolean> {
-    if (ensureIntNumber(chainId) === this.getChainId()) {
+
+    if (!request.chainName || request.chainName.trim() === '') {
+      throw standardErrors.rpc.invalidParams('chainName is a required field');
+    }
+
+    if (!request.nativeCurrency) {
+      throw standardErrors.rpc.invalidParams('nativeCurrency is a required field');
+    }
+
+    const chainIdNumber = Number.parseInt(request.chainId, 16);
+
+    if (chainIdNumber === this.getChainId()) {
       return false;
     }
 
     const relay = this.initializeRelay();
 
-    if (!this._isAuthorized()) {
-      await relay.requestEthereumAccounts();
-    }
+    const {
+      rpcUrls = [],
+      blockExplorerUrls = [],
+      chainName,
+      iconUrls = [],
+      nativeCurrency,
+    } = request;
 
     const res = await relay.addEthereumChain(
-      chainId.toString(),
+      chainIdNumber.toString(),
       rpcUrls,
       iconUrls,
       blockExplorerUrls,
@@ -199,97 +185,43 @@ export class WalletLinkSigner implements Signer {
     if (isErrorResponse(res)) return false;
 
     if (res.result?.isApproved === true) {
-      this.updateProviderInfo(rpcUrls[0], chainId);
+      this.updateProviderInfo(rpcUrls[0], chainIdNumber);
+      return null;
     }
-
-    return res.result?.isApproved === true;
+    throw standardErrors.rpc.internal('unable to add ethereum chain');
   }
 
-  private async switchEthereumChain(chainId: number) {
+  private async switchEthereumChain(params: RequestParam) {
+    const request = params[0] as {
+      chainId: string;
+    };
+    const chainId = Number.parseInt(request.chainId, 16);
+
     const relay = this.initializeRelay();
     const res = await relay.switchEthereumChain(
       chainId.toString(10),
       this.selectedAddress || undefined
     );
 
-    // backward compatibility
-    if (isErrorResponse(res)) {
-      if (!res.errorCode) return;
-      if (res.errorCode === standardErrorCodes.provider.unsupportedChain) {
-        throw standardErrors.provider.unsupportedChain();
-      } else {
-        throw standardErrors.provider.custom({
-          message: res.errorMessage,
-          code: res.errorCode,
-        });
-      }
-    }
+    if (isErrorResponse(res)) throw res;
 
     const switchResponse = res.result;
     if (switchResponse.isApproved && switchResponse.rpcUrl.length > 0) {
       this.updateProviderInfo(switchResponse.rpcUrl, chainId);
     }
+
+    return null;
   }
 
-  public async disconnect() {
+  public async cleanup() {
+    this.callback = null;
     if (this._relay) {
       this._relay.resetAndReload();
     }
     this._storage.clear();
   }
 
-  public async request<T>(args: RequestArguments): Promise<T> {
-    try {
-      return this._request<T>(args).catch((error) => {
-        throw error;
-      });
-    } catch (error) {
-      return Promise.reject(error);
-    }
-  }
-  private async _request<T>(args: RequestArguments): Promise<T> {
-    if (!args || typeof args !== 'object' || Array.isArray(args)) {
-      throw standardErrors.rpc.invalidRequest({
-        message: 'Expected a single, non-array, object argument.',
-        data: args,
-      });
-    }
-
-    const { method, params } = args;
-
-    if (typeof method !== 'string' || method.length === 0) {
-      throw standardErrors.rpc.invalidRequest({
-        message: "'args.method' must be a non-empty string.",
-        data: args,
-      });
-    }
-
-    if (
-      params !== undefined &&
-      !Array.isArray(params) &&
-      (typeof params !== 'object' || params === null)
-    ) {
-      throw standardErrors.rpc.invalidRequest({
-        message: "'args.params' must be an object or array if provided.",
-        data: args,
-      });
-    }
-
-    const newParams = params === undefined ? [] : params;
-
-    // Coinbase Wallet Requests
-    const id = this._relayEventManager.makeRequestId();
-    const result = await this._sendRequestAsync({
-      method,
-      params: newParams,
-      jsonrpc: '2.0',
-      id,
-    });
-
-    return result.result as T;
-  }
-
-  protected _setAddresses(addresses: string[], _?: boolean): void {
+  private _setAddresses(addresses: string[], _?: boolean): void {
     if (!Array.isArray(addresses)) {
       throw new Error('addresses is not an array');
     }
@@ -301,74 +233,32 @@ export class WalletLinkSigner implements Signer {
     }
 
     this._addresses = newAddresses;
-    this.updateListener?.onAccountsUpdate({
-      accounts: newAddresses,
-      source: 'wallet',
-    });
+    this.callback?.('accountsChanged', newAddresses);
     this._storage.setItem(LOCAL_STORAGE_ADDRESSES_KEY, newAddresses.join(' '));
   }
 
-  private _sendRequestAsync(request: JSONRPCRequest): Promise<JSONRPCResponse> {
-    return new Promise<JSONRPCResponse>((resolve, reject) => {
-      try {
-        const syncResult = this._handleSynchronousMethods(request);
-        if (syncResult !== undefined) {
-          return resolve({
-            jsonrpc: '2.0',
-            id: request.id,
-            result: syncResult,
-          });
-        }
-      } catch (err: any) {
-        return reject(err);
-      }
+  async request(request: RequestArguments) {
+    const params = (request.params as RequestParam) || [];
 
-      this._handleAsynchronousMethods(request)
-        .then((res) => res && resolve({ ...res, id: request.id }))
-        .catch((err) => reject(err));
-    });
-  }
-
-  private _handleSynchronousMethods(request: JSONRPCRequest) {
-    const { method } = request;
-
-    switch (method) {
+    switch (request.method) {
       case 'eth_accounts':
-        return this._eth_accounts();
-
+        return [...this._addresses];
       case 'eth_coinbase':
-        return this._eth_coinbase();
-
+        return this.selectedAddress || null;
       case 'net_version':
-        return this._net_version();
-
+        return this.getChainId().toString(10);
       case 'eth_chainId':
-        return this._eth_chainId();
+        return hexStringFromNumber(this.getChainId());
 
-      default:
-        return undefined;
-    }
-  }
-
-  private async _handleAsynchronousMethods(request: JSONRPCRequest): Promise<JSONRPCResponse> {
-    const { method } = request;
-    const params = request.params || [];
-
-    switch (method) {
       case 'eth_requestAccounts':
         return this._eth_requestAccounts();
 
-      case 'eth_sign':
-        return this._eth_sign(params);
-
       case 'eth_ecRecover':
-        return this._eth_ecRecover(params);
+      case 'personal_ecRecover':
+        return this.ecRecover(request);
 
       case 'personal_sign':
-        return this._personal_sign(params);
-
-      case 'personal_ecRecover':
-        return this._personal_ecRecover(params);
+        return this.personalSign(request);
 
       case 'eth_signTransaction':
         return this._eth_signTransaction(params);
@@ -380,45 +270,30 @@ export class WalletLinkSigner implements Signer {
         return this._eth_sendTransaction(params);
 
       case 'eth_signTypedData_v1':
-        return this._eth_signTypedData_v1(params);
-
-      case 'eth_signTypedData_v2':
-        return this._throwUnsupportedMethodError();
-
       case 'eth_signTypedData_v3':
-        return this._eth_signTypedData_v3(params);
-
       case 'eth_signTypedData_v4':
       case 'eth_signTypedData':
-        return this._eth_signTypedData_v4(params);
+        return this.signTypedData(request);
 
       case 'wallet_addEthereumChain':
-        return this._wallet_addEthereumChain(params);
+        return this.addEthereumChain(params);
 
       case 'wallet_switchEthereumChain':
-        return this._wallet_switchEthereumChain(params);
+        return this.switchEthereumChain(params);
 
       case 'wallet_watchAsset':
-        return this._wallet_watchAsset(params);
+        return this.watchAsset(params);
 
       default:
-        return this._throwUnsupportedMethodError();
+        if (!this.jsonRpcUrl) throw standardErrors.rpc.internal('No RPC URL set for chain');
+        return fetchRPCRequest(request, this.jsonRpcUrl);
     }
-  }
-
-  private _isKnownAddress(addressString: string): boolean {
-    try {
-      const addressStr = ensureAddressString(addressString);
-      const lowercaseAddresses = this._addresses.map((address) => ensureAddressString(address));
-      return lowercaseAddresses.includes(addressStr);
-    } catch {
-      // noop
-    }
-    return false;
   }
 
   private _ensureKnownAddress(addressString: string): void {
-    if (!this._isKnownAddress(addressString)) {
+    const addressStr = ensureAddressString(addressString);
+    const lowercaseAddresses = this._addresses.map((address) => ensureAddressString(address));
+    if (!lowercaseAddresses.includes(addressStr)) {
       throw new Error('Unknown Ethereum address');
     }
   }
@@ -467,315 +342,141 @@ export class WalletLinkSigner implements Signer {
     };
   }
 
-  protected _isAuthorized(): boolean {
-    return this._addresses.length > 0;
-  }
+  private async ecRecover(request: RequestArguments) {
+    const { method, params } = request;
+    if (!Array.isArray(params)) throw standardErrors.rpc.invalidParams();
 
-  private _requireAuthorization(): void {
-    if (!this._isAuthorized()) {
-      throw standardErrors.provider.unauthorized({});
-    }
-  }
-
-  private _throwUnsupportedMethodError(): Promise<JSONRPCResponse> {
-    throw standardErrors.provider.unsupportedMethod({});
-  }
-
-  private async _signEthereumMessage(
-    message: Buffer,
-    address: AddressString,
-    addPrefix: boolean,
-    typedDataJson?: string | null
-  ): Promise<JSONRPCResponse> {
-    this._ensureKnownAddress(address);
-
-    try {
-      const relay = this.initializeRelay();
-      const res = await relay.signEthereumMessage(message, address, addPrefix, typedDataJson);
-      if (isErrorResponse(res)) {
-        throw new Error(res.errorMessage);
-      }
-      return { jsonrpc: '2.0', id: 0, result: res.result };
-    } catch (err: any) {
-      if (typeof err.message === 'string' && err.message.match(/(denied|rejected)/i)) {
-        throw standardErrors.provider.userRejectedRequest('User denied message signature');
-      }
-      throw err;
-    }
-  }
-
-  private async _ethereumAddressFromSignedMessage(
-    message: Buffer,
-    signature: Buffer,
-    addPrefix: boolean
-  ): Promise<JSONRPCResponse> {
     const relay = this.initializeRelay();
-    const res = await relay.ethereumAddressFromSignedMessage(message, signature, addPrefix);
-    if (isErrorResponse(res)) {
-      throw new Error(res.errorMessage);
-    }
-    return { jsonrpc: '2.0', id: 0, result: res.result };
+    const res = await relay.sendRequest({
+      method: 'ethereumAddressFromSignedMessage',
+      params: {
+        message: encodeToHexString(params[0]),
+        signature: encodeToHexString(params[1]),
+        addPrefix: method === 'personal_ecRecover',
+      },
+    });
+    if (isErrorResponse(res)) throw res;
+    return res.result;
   }
 
-  private _eth_accounts(): string[] {
-    return [...this._addresses];
+  private getChainId(): number {
+    return Number.parseInt(this._storage.getItem(DEFAULT_CHAIN_ID_KEY) ?? '1', 10);
   }
 
-  private _eth_coinbase(): string | null {
-    return this.selectedAddress || null;
-  }
-
-  private _net_version(): string {
-    return this.getChainId().toString(10);
-  }
-
-  private _eth_chainId(): string {
-    return hexStringFromIntNumber(this.getChainId());
-  }
-
-  private getChainId(): IntNumber {
-    const chainIdStr = this._storage.getItem(DEFAULT_CHAIN_ID_KEY);
-
-    if (!chainIdStr) {
-      return ensureIntNumber(1); // default to mainnet
+  private async _eth_requestAccounts() {
+    if (this._addresses.length > 0) {
+      this.callback?.('connect', { chainId: hexStringFromNumber(this.getChainId()) });
+      return this._addresses;
     }
 
-    const chainId = parseInt(chainIdStr, 10);
-    return ensureIntNumber(chainId);
-  }
-
-  private async _eth_requestAccounts(): Promise<JSONRPCResponse> {
-    if (this._isAuthorized()) {
-      return Promise.resolve({
-        jsonrpc: '2.0',
-        id: 0,
-        result: this._addresses,
-      });
-    }
-
-    let res: Web3Response<'requestEthereumAccounts'>;
-    try {
-      const relay = this.initializeRelay();
-      res = await relay.requestEthereumAccounts();
-      if (isErrorResponse(res)) {
-        throw new Error(res.errorMessage);
-      }
-    } catch (err: any) {
-      if (typeof err.message === 'string' && err.message.match(/(denied|rejected)/i)) {
-        throw standardErrors.provider.userRejectedRequest('User denied account authorization');
-      }
-      throw err;
-    }
+    const relay = this.initializeRelay();
+    const res = await relay.requestEthereumAccounts();
+    if (isErrorResponse(res)) throw res;
 
     if (!res.result) {
       throw new Error('accounts received is empty');
     }
 
     this._setAddresses(res.result);
-
-    return { jsonrpc: '2.0', id: 0, result: this._addresses };
+    this.callback?.('connect', { chainId: hexStringFromNumber(this.getChainId()) });
+    return this._addresses;
   }
 
-  private _eth_sign(params: unknown[]): Promise<JSONRPCResponse> {
-    this._requireAuthorization();
-    const address = ensureAddressString(params[0]);
-    const message = ensureBuffer(params[1]);
+  private async personalSign({ params }: RequestArguments) {
+    if (!Array.isArray(params)) throw standardErrors.rpc.invalidParams();
 
-    return this._signEthereumMessage(message, address, false);
+    const address = params[1];
+    const rawData = params[0];
+    this._ensureKnownAddress(address);
+
+    const relay = this.initializeRelay();
+    const res = await relay.sendRequest({
+      method: 'signEthereumMessage',
+      params: {
+        address: ensureAddressString(address),
+        message: encodeToHexString(rawData),
+        addPrefix: true,
+        typedDataJson: null,
+      },
+    });
+
+    if (isErrorResponse(res)) throw res;
+    return res.result;
   }
 
-  private _eth_ecRecover(params: unknown[]): Promise<JSONRPCResponse> {
-    const message = ensureBuffer(params[0]);
-    const signature = ensureBuffer(params[1]);
-    return this._ethereumAddressFromSignedMessage(message, signature, false);
+  private async _eth_signTransaction(params: RequestParam) {
+    const tx = this._prepareTransactionParams(params[0] || {});
+
+    const relay = this.initializeRelay();
+    const res = await relay.signEthereumTransaction(tx);
+    if (isErrorResponse(res)) throw res;
+    return res.result;
   }
 
-  private _personal_sign(params: unknown[]): Promise<JSONRPCResponse> {
-    this._requireAuthorization();
-    const message = ensureBuffer(params[0]);
-    const address = ensureAddressString(params[1]);
-
-    return this._signEthereumMessage(message, address, true);
-  }
-
-  private _personal_ecRecover(params: unknown[]): Promise<JSONRPCResponse> {
-    const message = ensureBuffer(params[0]);
-    const signature = ensureBuffer(params[1]);
-
-    return this._ethereumAddressFromSignedMessage(message, signature, true);
-  }
-
-  private async _eth_signTransaction(params: unknown[]): Promise<JSONRPCResponse> {
-    this._requireAuthorization();
-    const tx = this._prepareTransactionParams((params[0] as any) || {});
-    try {
-      const relay = this.initializeRelay();
-      const res = await relay.signEthereumTransaction(tx);
-      if (isErrorResponse(res)) {
-        throw new Error(res.errorMessage);
-      }
-      return { jsonrpc: '2.0', id: 0, result: res.result };
-    } catch (err: any) {
-      if (typeof err.message === 'string' && err.message.match(/(denied|rejected)/i)) {
-        throw standardErrors.provider.userRejectedRequest('User denied transaction signature');
-      }
-      throw err;
-    }
-  }
-
-  private async _eth_sendRawTransaction(params: unknown[]): Promise<JSONRPCResponse> {
+  private async _eth_sendRawTransaction(params: RequestParam) {
     const signedTransaction = ensureBuffer(params[0]);
     const relay = this.initializeRelay();
     const res = await relay.submitEthereumTransaction(signedTransaction, this.getChainId());
-    if (isErrorResponse(res)) {
-      throw new Error(res.errorMessage);
-    }
-    return { jsonrpc: '2.0', id: 0, result: res.result };
+    if (isErrorResponse(res)) throw res;
+    return res.result;
   }
 
-  private async _eth_sendTransaction(params: unknown[]): Promise<JSONRPCResponse> {
-    this._requireAuthorization();
-    const tx = this._prepareTransactionParams((params[0] as any) || {});
-    try {
-      const relay = this.initializeRelay();
-      const res = await relay.signAndSubmitEthereumTransaction(tx);
-      if (isErrorResponse(res)) {
-        throw new Error(res.errorMessage);
-      }
-      return { jsonrpc: '2.0', id: 0, result: res.result };
-    } catch (err: any) {
-      if (typeof err.message === 'string' && err.message.match(/(denied|rejected)/i)) {
-        throw standardErrors.provider.userRejectedRequest('User denied transaction signature');
-      }
-      throw err;
-    }
+  private async _eth_sendTransaction(params: RequestParam) {
+    const tx = this._prepareTransactionParams(params[0] || {});
+
+    const relay = this.initializeRelay();
+    const res = await relay.signAndSubmitEthereumTransaction(tx);
+    if (isErrorResponse(res)) throw res;
+    return res.result;
   }
 
-  private async _eth_signTypedData_v1(params: unknown[]): Promise<JSONRPCResponse> {
-    this._requireAuthorization();
-    const typedData = ensureParsedJSONObject(params[0]);
-    const address = ensureAddressString(params[1]);
+  private async signTypedData(request: RequestArguments) {
+    const { method, params } = request;
+    if (!Array.isArray(params)) throw standardErrors.rpc.invalidParams();
 
-    this._ensureKnownAddress(address);
-
-    const message = eip712.hashForSignTypedDataLegacy({ data: typedData });
-    const typedDataJSON = JSON.stringify(typedData, null, 2);
-
-    return this._signEthereumMessage(message, address, false, typedDataJSON);
-  }
-
-  private async _eth_signTypedData_v3(params: unknown[]): Promise<JSONRPCResponse> {
-    this._requireAuthorization();
-    const address = ensureAddressString(params[0]);
-    const typedData = ensureParsedJSONObject(params[1]);
-
-    this._ensureKnownAddress(address);
-
-    const message = eip712.hashForSignTypedData_v3({ data: typedData });
-    const typedDataJSON = JSON.stringify(typedData, null, 2);
-
-    return this._signEthereumMessage(message, address, false, typedDataJSON);
-  }
-
-  private async _eth_signTypedData_v4(params: unknown[]): Promise<JSONRPCResponse> {
-    this._requireAuthorization();
-    const address = ensureAddressString(params[0]);
-    const typedData = ensureParsedJSONObject(params[1]);
-
-    this._ensureKnownAddress(address);
-
-    const message = eip712.hashForSignTypedData_v4({ data: typedData });
-    const typedDataJSON = JSON.stringify(typedData, null, 2);
-
-    return this._signEthereumMessage(message, address, false, typedDataJSON);
-  }
-
-  private async _wallet_addEthereumChain(params: unknown[]): Promise<JSONRPCResponse> {
-    const request = params[0] as AddEthereumChainParams;
-
-    if (request.rpcUrls?.length === 0) {
-      return {
-        jsonrpc: '2.0',
-        id: 0,
-        error: { code: 2, message: `please pass in at least 1 rpcUrl` },
+    const encode = (input: object) => {
+      const hashFuncMap = {
+        eth_signTypedData_v1: eip712.hashForSignTypedDataLegacy,
+        eth_signTypedData_v3: eip712.hashForSignTypedData_v3,
+        eth_signTypedData_v4: eip712.hashForSignTypedData_v4,
+        eth_signTypedData: eip712.hashForSignTypedData_v4,
       };
-    }
-
-    if (!request.chainName || request.chainName.trim() === '') {
-      throw standardErrors.rpc.invalidParams('chainName is a required field');
-    }
-
-    if (!request.nativeCurrency) {
-      throw standardErrors.rpc.invalidParams('nativeCurrency is a required field');
-    }
-
-    const chainIdNumber = parseInt(request.chainId, 16);
-    const success = await this.addEthereumChain(
-      chainIdNumber,
-      request.rpcUrls ?? [],
-      request.blockExplorerUrls ?? [],
-      request.chainName,
-      request.iconUrls ?? [],
-      request.nativeCurrency
-    );
-    if (success) {
-      return { jsonrpc: '2.0', id: 0, result: null };
-    }
-    return {
-      jsonrpc: '2.0',
-      id: 0,
-      error: { code: 2, message: `unable to add ethereum chain` },
+      return hexStringFromBuffer(
+        hashFuncMap[method as keyof typeof hashFuncMap]({
+          data: ensureParsedJSONObject(input),
+        }) as Buffer,
+        true
+      );
     };
-  }
 
-  private async _wallet_switchEthereumChain(params: unknown[]): Promise<JSONRPCResponse> {
-    const request = params[0] as SwitchEthereumChainParams;
-    await this.switchEthereumChain(parseInt(request.chainId, 16));
-    return { jsonrpc: '2.0', id: 0, result: null };
-  }
+    const address = params[method === 'eth_signTypedData_v1' ? 1 : 0];
+    const rawData = params[method === 'eth_signTypedData_v1' ? 0 : 1];
+    this._ensureKnownAddress(address);
 
-  private async _wallet_watchAsset(params: unknown): Promise<JSONRPCResponse> {
-    const request = (Array.isArray(params) ? params[0] : params) as WatchAssetParams;
-    if (!request.type) {
-      throw standardErrors.rpc.invalidParams('Type is required');
-    }
+    const relay = this.initializeRelay();
+    const res = await relay.sendRequest({
+      method: 'signEthereumMessage',
+      params: {
+        address: ensureAddressString(address),
+        message: encode(rawData),
+        typedDataJson: JSON.stringify(rawData, null, 2),
+        addPrefix: false,
+      },
+    });
 
-    if (request?.type !== 'ERC20') {
-      throw standardErrors.rpc.invalidParams(`Asset of type '${request.type}' is not supported`);
-    }
-
-    if (!request?.options) {
-      throw standardErrors.rpc.invalidParams('Options are required');
-    }
-
-    if (!request?.options.address) {
-      throw standardErrors.rpc.invalidParams('Address is required');
-    }
-
-    const chainId = this.getChainId();
-    const { address, symbol, image, decimals } = request.options;
-
-    const res = await this.watchAsset(request.type, address, symbol, decimals, image, chainId);
-
-    return { jsonrpc: '2.0', id: 0, result: res };
+    if (isErrorResponse(res)) throw res;
+    return res.result;
   }
 
   private initializeRelay(): WalletLinkRelay {
     if (!this._relay) {
-      const relay = new WalletLinkRelay({
+      this._relay = new WalletLinkRelay({
         linkAPIUrl: WALLETLINK_URL,
         storage: this._storage,
+        metadata: this.metadata,
+        accountsCallback: this._setAddresses.bind(this),
+        chainCallback: this.updateProviderInfo.bind(this),
       });
-      relay.setAppInfo(this._appName, this._appLogoUrl);
-      relay.attachUI();
-
-      relay.setAccountsCallback((accounts, isDisconnect) =>
-        this._setAddresses(accounts, isDisconnect)
-      );
-      relay.setChainCallback((chainId, jsonRpcUrl) => {
-        this.updateProviderInfo(jsonRpcUrl, parseInt(chainId, 10));
-      });
-      this._relay = relay;
     }
     return this._relay;
   }

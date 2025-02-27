@@ -1,139 +1,96 @@
-import EventEmitter from 'eventemitter3';
-
-import { standardErrorCodes, standardErrors } from './core/error';
-import { serializeError } from './core/error/serialize';
+import { Signer } from './sign/interface.js';
+import { createSigner, fetchSignerType, loadSignerType, storeSignerType } from './sign/util.js';
+import { Communicator } from ':core/communicator/Communicator.js';
+import { CB_WALLET_RPC_URL } from ':core/constants.js';
+import { standardErrorCodes } from ':core/error/constants.js';
+import { standardErrors } from ':core/error/errors.js';
+import { serializeError } from ':core/error/serialize.js';
+import { SignerType } from ':core/message/ConfigMessage.js';
 import {
   AppMetadata,
   ConstructorOptions,
   Preference,
+  ProviderEventEmitter,
   ProviderInterface,
   RequestArguments,
-  Signer,
-} from './core/provider/interface';
-import { AddressString, Chain, IntNumber } from './core/type';
-import { areAddressArraysEqual, hexStringFromIntNumber } from './core/type/util';
-import { AccountsUpdate, ChainUpdate } from './sign/interface';
-import { createSigner, fetchSignerType, loadSignerType, storeSignerType } from './sign/util';
-import { checkErrorForInvalidRequestArgs, fetchRPCRequest } from './util/provider';
-import { Communicator } from ':core/communicator/Communicator';
-import { SignerType } from ':core/message';
-import { determineMethodCategory } from ':core/provider/method';
-import { ScopedLocalStorage } from ':util/ScopedLocalStorage';
+} from ':core/provider/interface.js';
+import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage.js';
+import { hexStringFromNumber } from ':core/type/util.js';
+import { checkErrorForInvalidRequestArgs, fetchRPCRequest } from ':util/provider.js';
 
-export class CoinbaseWalletProvider extends EventEmitter implements ProviderInterface {
+export class CoinbaseWalletProvider extends ProviderEventEmitter implements ProviderInterface {
   private readonly metadata: AppMetadata;
   private readonly preference: Preference;
   private readonly communicator: Communicator;
 
-  private signer: Signer | null;
-  protected accounts: AddressString[] = [];
-  protected chain: Chain;
+  private signer: Signer | null = null;
 
   constructor({ metadata, preference: { keysUrl, ...preference } }: Readonly<ConstructorOptions>) {
     super();
     this.metadata = metadata;
     this.preference = preference;
-    this.communicator = new Communicator(keysUrl);
-    this.chain = {
-      id: metadata.appChainIds?.[0] ?? 1,
-    };
-    // Load states from storage
-    const signerType = loadSignerType();
-    this.signer = signerType ? this.initSigner(signerType) : null;
-  }
+    this.communicator = new Communicator({
+      url: keysUrl,
+      metadata,
+      preference,
+    });
 
-  public get connected() {
-    return this.accounts.length > 0;
+    const signerType = loadSignerType();
+    if (signerType) {
+      this.signer = this.initSigner(signerType);
+    }
   }
 
   public async request<T>(args: RequestArguments): Promise<T> {
     try {
-      const invalidArgsError = checkErrorForInvalidRequestArgs(args);
-      if (invalidArgsError) throw invalidArgsError;
-      // unrecognized methods are treated as fetch requests
-      const category = determineMethodCategory(args.method) ?? 'fetch';
-      return this.handlers[category](args) as T;
+      checkErrorForInvalidRequestArgs(args);
+      if (!this.signer) {
+        switch (args.method) {
+          case 'eth_requestAccounts': {
+            const signerType = await this.requestSignerSelection(args);
+            const signer = this.initSigner(signerType);
+            await signer.handshake(args);
+            this.signer = signer;
+            storeSignerType(signerType);
+            break;
+          }
+          case 'wallet_connect': {
+            const signer = this.initSigner('scw');
+            await signer.handshake({ method: 'handshake' }); // exchange session keys
+            const result = await signer.request(args); // send diffie-hellman encrypted request
+            this.signer = signer;
+            return result as T;
+          }
+          case 'wallet_sendCalls': {
+            const ephemeralSigner = this.initSigner('scw');
+            await ephemeralSigner.handshake({ method: 'handshake' }); // exchange session keys
+            const result = await ephemeralSigner.request(args); // send diffie-hellman encrypted request
+            await ephemeralSigner.cleanup(); // clean up (rotate) the ephemeral session keys
+            return result as T;
+          }
+          case 'wallet_getCallsStatus':
+            return fetchRPCRequest(args, CB_WALLET_RPC_URL);
+          case 'net_version':
+            return 1 as T; // default value
+          case 'eth_chainId':
+            return hexStringFromNumber(1) as T; // default value
+          default: {
+            throw standardErrors.provider.unauthorized(
+              "Must call 'eth_requestAccounts' before other methods"
+            );
+          }
+        }
+      }
+      return await this.signer.request(args);
     } catch (error) {
-      return Promise.reject(serializeError(error, args.method));
+      const { code } = error as { code?: number };
+      if (code === standardErrorCodes.provider.unauthorized) this.disconnect();
+      return Promise.reject(serializeError(error));
     }
   }
 
-  protected readonly handlers = {
-    // eth_requestAccounts
-    handshake: async (_: RequestArguments): Promise<AddressString[]> => {
-      try {
-        if (this.connected) {
-          this.emit('connect', { chainId: hexStringFromIntNumber(IntNumber(this.chain.id)) });
-          return this.accounts;
-        }
-
-        const signerType = await this.requestSignerSelection();
-        const signer = this.initSigner(signerType);
-        const accounts = await signer.handshake();
-
-        this.signer = signer;
-        storeSignerType(signerType);
-
-        this.emit('connect', { chainId: hexStringFromIntNumber(IntNumber(this.chain.id)) });
-        return accounts;
-      } catch (error) {
-        this.handleUnauthorizedError(error);
-        throw error;
-      }
-    },
-
-    sign: async (request: RequestArguments) => {
-      if (!this.connected || !this.signer) {
-        throw standardErrors.provider.unauthorized(
-          "Must call 'eth_requestAccounts' before other methods"
-        );
-      }
-      try {
-        return await this.signer.request(request);
-      } catch (error) {
-        this.handleUnauthorizedError(error);
-        throw error;
-      }
-    },
-
-    fetch: (request: RequestArguments) => fetchRPCRequest(request, this.chain),
-
-    state: (request: RequestArguments) => {
-      const getConnectedAccounts = (): AddressString[] => {
-        if (this.connected) return this.accounts;
-        throw standardErrors.provider.unauthorized(
-          "Must call 'eth_requestAccounts' before other methods"
-        );
-      };
-      switch (request.method) {
-        case 'eth_chainId':
-        case 'net_version':
-          return this.chain.id;
-        case 'eth_accounts':
-          return getConnectedAccounts();
-        case 'eth_coinbase':
-          return getConnectedAccounts()[0];
-        default:
-          return this.handlers.unsupported(request);
-      }
-    },
-
-    deprecated: ({ method }: RequestArguments) => {
-      throw standardErrors.rpc.methodNotSupported(`Method ${method} is deprecated.`);
-    },
-
-    unsupported: ({ method }: RequestArguments) => {
-      throw standardErrors.rpc.methodNotSupported(`Method ${method} is not supported.`);
-    },
-  };
-
-  private handleUnauthorizedError(error: unknown) {
-    const e = error as { code?: number };
-    if (e.code === standardErrorCodes.provider.unauthorized) this.disconnect();
-  }
-
   /** @deprecated Use `.request({ method: 'eth_requestAccounts' })` instead. */
-  public async enable(): Promise<unknown> {
+  public async enable() {
     console.warn(
       `.enable() has been deprecated. Please use .request({ method: "eth_requestAccounts" }) instead.`
     );
@@ -142,35 +99,22 @@ export class CoinbaseWalletProvider extends EventEmitter implements ProviderInte
     });
   }
 
-  async disconnect(): Promise<void> {
-    this.accounts = [];
-    this.chain = { id: 1 };
+  async disconnect() {
+    await this.signer?.cleanup();
+    this.signer = null;
     ScopedLocalStorage.clearAll();
     this.emit('disconnect', standardErrors.provider.disconnected('User initiated disconnection'));
   }
 
   readonly isCoinbaseWallet = true;
 
-  protected readonly updateListener = {
-    onAccountsUpdate: ({ accounts, source }: AccountsUpdate) => {
-      if (areAddressArraysEqual(this.accounts, accounts)) return;
-      this.accounts = accounts;
-      if (source === 'storage') return;
-      this.emit('accountsChanged', this.accounts);
-    },
-    onChainUpdate: ({ chain, source }: ChainUpdate) => {
-      if (chain.id === this.chain.id && chain.rpcUrl === this.chain.rpcUrl) return;
-      this.chain = chain;
-      if (source === 'storage') return;
-      this.emit('chainChanged', hexStringFromIntNumber(IntNumber(chain.id)));
-    },
-  };
-
-  private requestSignerSelection(): Promise<SignerType> {
+  private requestSignerSelection(handshakeRequest: RequestArguments): Promise<SignerType> {
     return fetchSignerType({
       communicator: this.communicator,
       preference: this.preference,
       metadata: this.metadata,
+      handshakeRequest,
+      callback: this.emit.bind(this),
     });
   }
 
@@ -179,7 +123,7 @@ export class CoinbaseWalletProvider extends EventEmitter implements ProviderInte
       signerType,
       metadata: this.metadata,
       communicator: this.communicator,
-      updateListener: this.updateListener,
+      callback: this.emit.bind(this),
     });
   }
 }

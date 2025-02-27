@@ -1,17 +1,10 @@
 {
-  "extends": "../../tsconfig.base.json",
+  "extends": "./tsconfig.base.json",
   "compilerOptions": {
+    "allowJs": false,
     "declaration": true,
-    "outDir": "./dist",
-    "baseUrl": ".",
-    "paths": {
-      ":util/*": ["src/util/*"],
-      ":core/*": ["src/core/*"]
-    },
-    "target": "es2017",
-    "jsx": "react",
-    "jsxFactory": "h",
-    "sourceMap": false,
+    "declarationMap": true,
+    "sourceMap": true,
   },
   "include": ["src"],
   "exclude": ["dist", "build", "**/*.test.*", "mocks"]

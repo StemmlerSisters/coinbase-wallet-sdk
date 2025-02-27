@@ -1,10 +1,10 @@
+import { ScopedLocalStorage } from ':core/storage/ScopedLocalStorage.js';
 import {
   deriveSharedSecret,
   exportKeyToHexString,
   generateKeyPair,
   importKeyFromHexString,
-} from ':util/cipher';
-import { ScopedLocalStorage } from ':util/ScopedLocalStorage';
+} from ':util/cipher.js';
 
 interface StorageItem {
   storageKey: string;
